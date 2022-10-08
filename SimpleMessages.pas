@@ -50,7 +50,8 @@ type
     Result: TSMMessageResult;
   end;
 
-  TSMDispatchFlag = (dfSentMessage,dfBroadcastedMessage,dfStopDispatching);
+  TSMDispatchFlag = (dfSentMessage,dfBroadcastedMessage,dfDirectDispatch,
+                     dfStopDispatching);
 
   TSMDispatchFlags = set of TSMDispatchFlag;
 
@@ -123,10 +124,10 @@ type
     Recipient:  TSMClientID;
     Flags:      TSMMessageFlags;
     Timestamp:  TSMMessageTimestamp;
-    P1_Result:  TSMMessageParam;  // also reused for result
+    P1_Result:  TSMMessageParam;
     P2_Counter: TSMMessageParam;
     MasterMsg:  TSMMessageIndex;
-    // linked list indices
+    // linked list indices...
     Index:      TSMMessageIndex;
     Prev:       TSMMessageIndex;
     Next:       TSMMessageIndex;
@@ -135,30 +136,40 @@ type
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 type
-  TMSClientSynchonizer = record
+  TSMClientSynchonizer = record
     Assigned:     Boolean;
     Identifier:   TGUID;
     Synchronizer: TEvent;
   end;
 
-  TMSClientSynchonizers = array of TMSClientSynchonizer;
+  TSMClientSynchonizers = array of TSMClientSynchonizer;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 type
-  TMSFetchMessagesResult = (lmrSentMessage,lmrPostedMessage);
+  TSMFetchMessagesResult = (lmrSentMessage,lmrPostedMessage);
 
-  TMSFetchMessagesResults = set of TMSFetchMessagesResult;
+  TSMFetchMessagesResults = set of TSMFetchMessagesResult;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+type
+  TSMExtraInfo = record
+    ClientCount:      Integer;
+    MaxClients:       Integer;
+    MessageCount:     Integer;
+    MaxMessages:      Integer;
+    SharedMemorySize: TMemSize;
+  end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                                 TMSMessageVector
+                                 TSMMessageVector
 --------------------------------------------------------------------------------
 ===============================================================================}
 {===============================================================================
-    TMSMessageVector - class declaration
+    TSMMessageVector - class declaration
 ===============================================================================}
 type
-  TMSMessageVector = class(TMemVector)
+  TSMMessageVector = class(TMemVector)
   protected
     Function GetItem(Index: Integer): TSMShMemMessage; virtual;
     procedure SetItem(Index: Integer; Value: TSMShMemMessage); virtual;
@@ -178,14 +189,14 @@ type
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                              TSimpleMessageClient
+                              TSimpleMessagesClient
 --------------------------------------------------------------------------------
 ===============================================================================}
 {===============================================================================
-    TSimpleMessageClient - class declaration
+    TSimpleMessagesClient - class declaration
 ===============================================================================}
 type
-  TSimpleMessageClient = class(TCustomObject)
+  TSimpleMessagesClient = class(TCustomObject)
   protected
     fIsFounder:             Boolean;
     fClientID:              TSMClientID;
@@ -197,9 +208,10 @@ type
     fShMemMessageArr:       Pointer;
     fClientMap:             TBitVectorStatic;
     fSynchronizer:          TEvent;
-    fFetchedSentMessages:   TMSMessageVector;
-    fFetchedPostedMessages: TMSMessageVector;
-    fClientSyncs:           TMSClientSynchonizers;
+    fFetchedSentMessages:   TSMMessageVector;
+    fFetchedPostedMessages: TSMMessageVector;
+    fClientSyncs:           TSMClientSynchonizers;
+    fFullyInitialized:      Boolean;
     fOnMessageEvent:        TSMMessageEvent;
     fOnMessageCallback:     TSMMessageCallback;
     // geting item pointers
@@ -207,18 +219,20 @@ type
     Function GetMessageArrayItemPtr(MessageIndex: TSMMessageIndex): PSMShMemMessage; virtual;
     Function GetMessageArrayNextItemPtr(MessageItem: PSMShMemMessage): PSMShMemMessage; virtual;  // does not check bounds
     // internal workings
-    procedure DecoupleMessage(MessageIndex: TSMMessageIndex); virtual;                        // NL (= does not lock shared memory, but expects it to be locked)
-    Function AddMessage(const Msg: TSMShMemMessage): TSMMessageIndex; virtual;                // NL
-    procedure RemoveMessage(MessageIndex: TSMMessageIndex); virtual;                          // NL
-    procedure ReleaseSentMessage(MessageIndex: TSMMessageIndex; Processed: Boolean); virtual; // NL
-    procedure WakeClient(ClientIndex: Integer; SetFlags: UInt32); virtual;                    // NL
-    procedure WakeClientsMsgSlots; virtual;                                                   // NL
+    procedure DecoupleMessage(MessageIndex: TSMMessageIndex); virtual;          // NL (= does not lock shared memory, but expects it to be locked)
+    Function AddMessage(const Msg: TSMShMemMessage): TSMMessageIndex; virtual;  // NL
+    procedure RemoveMessage(MessageIndex: TSMMessageIndex); virtual;            // NL
+    procedure ReleaseSentMessage(MessageIndex: TSMMessageIndex; Processed: Boolean; MsgResult: TSMMessageResult); virtual;  // NL
+    procedure WakeClient(ClientIndex: Integer; SetFlags: UInt32); virtual;      // NL
+    procedure WakeClientsMsgSlots; virtual;                                     // NL
+    procedure WaitMessageSlots(ClientsCount: Boolean); virtual;                 // NL
     Function SendSinglecast(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): TSMMessageResult; virtual;
     Function SendBroadcast(Param1, Param2: TSMMessageParam): TSMMessageResult; virtual;
     Function PostSinglecast(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): Boolean; virtual;
     Function PostBroadcast(Param1, Param2: TSMMessageParam): Boolean; virtual;
     Function WaitMessages(Timeout: UInt32): Boolean; virtual;
-    Function FetchMessages: TMSFetchMessagesResults; virtual;
+    Function FetchMessages: TSMFetchMessagesResults; virtual;
+    Function DirectDispatchMessage(var Msg: TSMShMemMessage): TSMMessageResult; virtual;
     procedure DispatchSentMessages; virtual;
     procedure DispatchPostedMessages; virtual;
     Function InternalPeekMessages: Boolean; virtual;
@@ -236,12 +250,14 @@ type
     Function HighMessageIndex: TSMMessageIndex; virtual;
     Function CheckMessageIndex(MessageIndex: TSMMessageIndex): Boolean; virtual;
   public
-    constructor Create(MaxClients: Integer = SM_MAXCLIENTS_DEF; MaxMessages: Integer = SM_MAXMESSAGES_DEF; const NameSpace: String = '');
+    constructor Create(MaxClients: Integer = SM_MAXCLIENTS_DEF; MaxMessages: Integer = SM_MAXMESSAGES_DEF; const NameSpace: String = ''); overload;
+    constructor Create(const NameSpace: String); overload;
     destructor Destroy; override;
     Function SendMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): TSMMessageResult; virtual;
     Function PostMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): Boolean; virtual;
     procedure GetMessages(Timeout: UInt32 = INFINITE); virtual;
     procedure PeekMessages; virtual;
+    Function GetExtraInfo: TSMExtraInfo; virtual;
     property IsFounder: Boolean read fIsFounder;
     property ClientID: TSMClientID read fClientID;
     property OnMessageCallback: TSMMessageCallback read fOnMessageCallback write fOnMessageCallback;
@@ -317,34 +333,50 @@ If CurrentTime >= StartTime then
 else Result := INFINITE;
 end;
 
+//------------------------------------------------------------------------------
+
+Function ConstructMessage(Sender,Recipient: TSMClientID; Flags: TSMMessageFlags; P1,P2: TSMMessageParam; MasterMsg: TSMMessageIndex): TSMShMemMessage;
+begin
+Result.Sender := Sender;
+Result.Recipient := Recipient;
+Result.Flags := Flags;
+Result.Timestamp := GetTimestamp;
+Result.P1_Result := P1;
+Result.P2_Counter := P2;
+Result.MasterMsg := MasterMsg;
+Result.Index := -1;
+Result.Prev := -1;
+Result.Next := -1;
+end;
+
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                                 TMSMessageVector
+                                 TSMMessageVector
 --------------------------------------------------------------------------------
 ===============================================================================}
 {===============================================================================
-    TMSMessageVector - class implementation
+    TSMMessageVector - class implementation
 ===============================================================================}
 {-------------------------------------------------------------------------------
-    TMSMessageVector - protected methods
+    TSMMessageVector - protected methods
 -------------------------------------------------------------------------------}
 
-Function TMSMessageVector.GetItem(Index: Integer): TSMShMemMessage;
+Function TSMMessageVector.GetItem(Index: Integer): TSMShMemMessage;
 begin
 Result := TSMShMemMessage(GetItemPtr(Index)^);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMSMessageVector.SetItem(Index: Integer; Value: TSMShMemMessage);
+procedure TSMMessageVector.SetItem(Index: Integer; Value: TSMShMemMessage);
 begin
 SetItemPtr(Index,@Value);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMSMessageVector.ItemCompare(Item1,Item2: Pointer): Integer;
+Function TSMMessageVector.ItemCompare(Item1,Item2: Pointer): Integer;
 begin
 {
   Order messages only by time.
@@ -361,10 +393,10 @@ else
 end;
 
 {-------------------------------------------------------------------------------
-    TMSMessageVector - public methods
+    TSMMessageVector - public methods
 -------------------------------------------------------------------------------}
 
-constructor TMSMessageVector.Create;
+constructor TSMMessageVector.Create;
 begin
 inherited Create(SizeOf(TSMShMemMessage));
 ShrinkMode := smKeepCap;
@@ -372,56 +404,56 @@ end;
 
 //   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
 
-constructor TMSMessageVector.Create(Memory: Pointer; Count: Integer);
+constructor TSMMessageVector.Create(Memory: Pointer; Count: Integer);
 begin
 inherited Create(Memory,Count,SizeOf(TSMShMemMessage));
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMSMessageVector.First: TSMShMemMessage;
+Function TSMMessageVector.First: TSMShMemMessage;
 begin
 Result := TSMShMemMessage(inherited First^);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMSMessageVector.Last: TSMShMemMessage;
+Function TSMMessageVector.Last: TSMShMemMessage;
 begin
 Result := TSMShMemMessage(inherited Last^);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMSMessageVector.IndexOf(Item: TSMShMemMessage): Integer;
+Function TSMMessageVector.IndexOf(Item: TSMShMemMessage): Integer;
 begin
 Result := inherited IndexOf(@Item);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMSMessageVector.Add(Item: TSMShMemMessage): Integer;
+Function TSMMessageVector.Add(Item: TSMShMemMessage): Integer;
 begin
 Result := inherited Add(@Item);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMSMessageVector.Insert(Index: Integer; Item: TSMShMemMessage);
+procedure TSMMessageVector.Insert(Index: Integer; Item: TSMShMemMessage);
 begin
 inherited Insert(Index,@Item);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMSMessageVector.Remove(Item: TSMShMemMessage): Integer;
+Function TSMMessageVector.Remove(Item: TSMShMemMessage): Integer;
 begin
 Result := inherited Remove(@Item);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMSMessageVector.Extract(Item: TSMShMemMessage): TSMShMemMessage;
+Function TSMMessageVector.Extract(Item: TSMShMemMessage): TSMShMemMessage;
 var
   TempPtr:  Pointer;
 begin
@@ -435,7 +467,7 @@ end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                              TSimpleMessageClient
+                              TSimpleMessagesClient
 --------------------------------------------------------------------------------
 ===============================================================================}
 const
@@ -449,46 +481,47 @@ const
   SM_CLIENTFLAG_MSGSLTWT = UInt32($00000004); // client is waiting for a free message slot
 
   SM_MSGFLAG_SENT       = UInt32($00000001);  // message was sent, not posted
-  SM_MSGFLAG_RELEASED   = UInt32($00000002);  // sender is released from waiting
-  SM_MSGFLAG_PROCESSED  = UInt32($00000003);  // message was processed by recipient
-  SM_MSGFLAG_BROADCAST  = UInt32($00000004);  // broadcasted message
-  SM_MSGFLAG_STBCMASTER = UInt32($00000008);  // sent broadcasted master message
+  SM_MSGFLAG_BROADCAST  = UInt32($00000002);  // broadcasted message
+  SM_MSGFLAG_MASTER     = UInt32($00000004);  // sent broadcasted master message
+  SM_MSGFLAG_FETCHED    = UInt32($00000008);  // message is fetched but not removed (sent messages, prevents refetching)
+  SM_MSGFLAG_RELEASED   = UInt32($00000010);  // sender is released from waiting
+  SM_MSGFLAG_PROCESSED  = UInt32($00000020);  // message was processed by recipient
 
 {===============================================================================
-    TSimpleMessageClient - class implementation
+    TSimpleMessagesClient - class implementation
 ===============================================================================}
 {-------------------------------------------------------------------------------
-    TSimpleMessageClient - protected methods
+    TSimpleMessagesClient - protected methods
 -------------------------------------------------------------------------------}
 
-Function TSimpleMessageClient.GetClientArrayItemPtr(ClientIndex: Integer): PSMShMemClient;
+Function TSimpleMessagesClient.GetClientArrayItemPtr(ClientIndex: Integer): PSMShMemClient;
 begin
 If CheckClientIndex(ClientIndex) then
   Result := PSMShMemClient(PtrUInt(fShMemClientArr) + PtrUInt(ClientIndex * SizeOf(TSMShMemClient)))
 else
-  raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessageClient.GetClientArrayItemPtr: Index (%d) out of bounds.',[ClientIndex]);
+  raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.GetClientArrayItemPtr: Index (%d) out of bounds.',[ClientIndex]);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.GetMessageArrayItemPtr(MessageIndex: TSMMessageIndex): PSMShMemMessage;
+Function TSimpleMessagesClient.GetMessageArrayItemPtr(MessageIndex: TSMMessageIndex): PSMShMemMessage;
 begin
 If CheckMessageIndex(MessageIndex) then
   Result := PSMShMemMessage(PtrUInt(fShMemMessageArr) + PtrUInt(MessageIndex * SizeOf(TSMShMemMessage)))
 else
-  raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessageClient.GetMessageArrayItemPtr: Index (%d) out of bounds.',[MessageIndex]);
+  raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.GetMessageArrayItemPtr: Index (%d) out of bounds.',[MessageIndex]);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.GetMessageArrayNextItemPtr(MessageItem: PSMShMemMessage): PSMShMemMessage;
+Function TSimpleMessagesClient.GetMessageArrayNextItemPtr(MessageItem: PSMShMemMessage): PSMShMemMessage;
 begin
 Result := PSMShMemMessage(PtrUInt(MessageItem) + PtrUInt(SizeOf(TSMShMemMessage)));
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.DecoupleMessage(MessageIndex: TSMMessageIndex);
+procedure TSimpleMessagesClient.DecoupleMessage(MessageIndex: TSMMessageIndex);
 var
   MessageItemPtr: PSMShMemMessage;
 begin
@@ -510,12 +543,12 @@ If CheckMessageIndex(MessageIndex) then
     MessageItemPtr^.Prev := -1;
     MessageItemPtr^.Next := -1;
   end
-else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessageClient.DecoupleMessage: Message index (%d) out of bounds.',[MessageIndex]);
+else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.DecoupleMessage: Message index (%d) out of bounds.',[MessageIndex]);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.AddMessage(const Msg: TSMShMemMessage): TSMMessageIndex;
+Function TSimpleMessagesClient.AddMessage(const Msg: TSMShMemMessage): TSMMessageIndex;
 var
   MessageItemPtr: PSMShMemMessage;
 begin
@@ -542,12 +575,12 @@ If CheckMessageIndex(fShMemHead^.Messages.FirstFree) then
     MessageItemPtr^.MasterMsg := Msg.MasterMsg;
     Inc(fShMemHead^.Messages.Count);
   end
-else raise ESMOutOfResources.Create('TSimpleMessageClient.AddMessage: No free message slot.');
+else raise ESMOutOfResources.Create('TSimpleMessagesClient.AddMessage: No free message slot.');
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.RemoveMessage(MessageIndex: TSMMessageIndex);
+procedure TSimpleMessagesClient.RemoveMessage(MessageIndex: TSMMessageIndex);
 var
   MessageItemPtr: PSMShMemMessage;
 begin
@@ -565,12 +598,49 @@ If CheckMessageIndex(MessageIndex) then
     fShMemHead^.Messages.LastFree := MessageIndex;
     Dec(fShMemHead^.Messages.Count);
   end
-else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessageClient.RemoveMessage: Message index (%d) out of bounds.',[MessageIndex]);
+else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.RemoveMessage: Message index (%d) out of bounds.',[MessageIndex]);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.WakeClient(ClientIndex: Integer; SetFlags: UInt32);
+procedure TSimpleMessagesClient.ReleaseSentMessage(MessageIndex: TSMMessageIndex; Processed: Boolean; MsgResult: TSMMessageResult);
+var
+  MessageItemPtr: PSMShMemMessage;
+begin
+If CheckMessageIndex(MessageIndex) then
+  begin
+    MessageItemPtr := GetMessageArrayItemPtr(MessageIndex);
+    If MessageItemPtr^.Flags and SM_MSGFLAG_SENT <> 0 then
+      begin
+        If Processed then
+          begin
+            MessageItemPtr^.Flags := MessageItemPtr^.Flags or SM_MSGFLAG_PROCESSED;
+            MessageItemPtr^.P1_Result := MsgResult;
+          end;
+        If MessageItemPtr^.Flags and SM_MSGFLAG_MASTER <> 0 then
+          begin
+            // broadcasted master message; decrement the counter
+            MessageItemPtr^.P2_Counter := TSMMEssageParam(Int64(MessageItemPtr^.P2_Counter) - 1);
+            If Int64(MessageItemPtr^.P2_Counter) <= 0 then
+              begin
+                MessageItemPtr^.Flags := MessageItemPtr^.Flags or SM_MSGFLAG_RELEASED;
+                WakeClient(Integer(MessageItemPtr^.Sender),0);
+              end;
+          end
+        else
+          begin
+            // singlecast message
+            MessageItemPtr^.Flags := MessageItemPtr^.Flags or SM_MSGFLAG_RELEASED;
+            WakeClient(Integer(MessageItemPtr^.Sender),0);
+          end;
+      end;
+  end
+else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.ReleaseMessage: Message index (%d) out of bounds.',[MessageIndex]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSimpleMessagesClient.WakeClient(ClientIndex: Integer; SetFlags: UInt32);
 var
   ClientItemPtr:  PSMShMemClient;
 
@@ -599,12 +669,12 @@ If CheckClientIndex(ClientIndex) then
     ClientItemPtr^.Flags := ClientItemPtr^.Flags or SetFlags;
     fClientSyncs[ClientIndex].Synchronizer.SetEventStrict;
   end
-else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessageClient.WakeClient: Client index (%d) out of bounds.',[ClientIndex]);
+else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.WakeClient: Client index (%d) out of bounds.',[ClientIndex]);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.WakeClientsMsgSlots;
+procedure TSimpleMessagesClient.WakeClientsMsgSlots;
 var
   FreeMsgSlots: Integer;
   i:            Integer;
@@ -615,9 +685,10 @@ If fShMemHead^.Clients.Flags and SM_CLIENTSFLAG_MSGSLTWT <> 0 then
     FreeMsgSlots := fShMemHead^.MaxMessages - fShMemHead^.Messages.Count;
     If FreeMsgSlots > 0 then
       For i := LowClientIndex to HighClientIndex do
-        If fClientMap[i] and (GetClientArrayItemPtr(i)^.Flags and SM_CLIENTFLAG_MSGSLTWT <> 0) then
+        If (i <> Integer(fClientID)) and fClientMap[i] and
+          (GetClientArrayItemPtr(i)^.Flags and SM_CLIENTFLAG_MSGSLTWT <> 0) then
           begin
-            WakeClient(TSMClientID(i),0);
+            WakeClient(i,0);
             If FreeMsgSlots > 1 then
               Dec(FreeMsgSlots)
             else
@@ -628,95 +699,164 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.ReleaseSentMessage(MessageIndex: TSMMessageIndex; Processed: Boolean);
-var
-  MessageItemPtr: PSMShMemMessage;
-  MasterMessage:  PSMShMemMessage;
-begin
-If CheckMessageIndex(MessageIndex) then
+procedure TSimpleMessagesClient.WaitMessageSlots(ClientsCount: Boolean);
+
+  Function TrueReqCount: Integer;
   begin
-    MessageItemPtr := GetMessageArrayItemPtr(MessageIndex);
-    If MessageItemPtr^.Flags and SM_MSGFLAG_SENT <> 0 then
+    If ClientsCount then
+      Result := fShMemHead^.Clients.Count
+    else
+      Result := 1;
+  end;
+
+var
+  i:  Integer;
+begin
+If fShMemHead^.MaxMessages < (fShMemHead^.Messages.Count + TrueReqCount) then
+  begin
+    while fShMemHead^.MaxMessages < (fShMemHead^.Messages.Count + TrueReqCount) do
       begin
-        If MessageItemPtr^.Flags and SM_MSGFLAG_BROADCAST <> 0 then
-          begin
-            // broadcasted message
-            If CheckMessageIndex(MessageItemPtr^.MasterMsg) then
-              begin
-                MasterMessage := GetMessageArrayItemPtr(MessageItemPtr^.MasterMsg);
-                If MasterMessage^.Flags and SM_MSGFLAG_STBCMASTER <> 0 then
-                  begin
-                    If Processed then
-                      MasterMessage^.Flags := MasterMessage^.Flags or SM_MSGFLAG_PROCESSED;
-                    MasterMessage^.P1_Result := MessageItemPtr^.P1_Result;
-                    MasterMessage^.P2_Counter := UInt64(Int64(MasterMessage^.P2_Counter) - 1);
-                    If Int64(MasterMessage^.P2_Counter) <= 0 then
-                      begin
-                        MasterMessage^.Flags := MasterMessage^.Flags or SM_MSGFLAG_RELEASED;
-                        WakeClient(Integer(MasterMessage^.Sender),0);
-                      end;
-                  end;
-              end;
-            RemoveMessage(MessageIndex);  // remove the submessage
-          end
-        else
-          begin
-            // singlecast message
-            MessageItemPtr^.Flags := MessageItemPtr^.Flags or SM_MSGFLAG_RELEASED;
-            If Processed then
-              MessageItemPtr^.Flags := MessageItemPtr^.Flags or SM_MSGFLAG_PROCESSED;
-            WakeClient(Integer(MessageItemPtr^.Sender),0);
-          end;
+        fShMemClient^.Flags := fShMemClient^.Flags or SM_CLIENTFLAG_MSGSLTWT;
+        fShMemHead^.Clients.Flags := fShMemHead^.Clients.Flags or SM_CLIENTSFLAG_MSGSLTWT;
+        fSharedMemory.Unlock;
+        try
+          fSynchronizer.WaitFor; // infinite wait
+        finally
+          fSharedMemory.Lock;
+        end;
       end;
-  end
-else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessageClient.ReleaseMessage: Message index (%d) out of bounds.',[MessageIndex]);
+    // clear the flags
+    fShMemClient^.Flags := fShMemClient^.Flags and not SM_CLIENTFLAG_MSGSLTWT;
+    fShMemHead^.Clients.Flags := fShMemHead^.Clients.Flags and not SM_CLIENTSFLAG_MSGSLTWT;
+    // check whether some other client is waiting for a free slot, if so, mark it again in clients flags
+    For i := LowClientIndex to HighClientIndex do
+      If GetClientArrayItemPtr(i).Flags and SM_CLIENTFLAG_MSGSLTWT <> 0 then
+        begin
+          fShMemHead^.Clients.Flags := fShMemHead^.Clients.Flags or SM_CLIENTSFLAG_MSGSLTWT;
+          Break{For i};
+        end;
+  end;
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.SendSinglecast(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): TSMMessageResult;
-//var
-//  TempMessage:  TSMShMemMessage;
-//  MessageIndex: TSMMessageIndex;
+Function TSimpleMessagesClient.SendSinglecast(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): TSMMessageResult;
+var
+  TempMessage:    TSMShMemMessage;
+  MessageItemPtr: PSMShMemMessage;
 begin
 Result := 0;
-(*
+TempMessage := ConstructMessage(fClientID,Recipient,SM_MSGFLAG_SENT,Param1,Param2,-1);
+// do actual sending only when the recipiend is not this instance
+If Recipient <> fClientID then
+  begin
+    fSharedMemory.Lock;
+    try
+      If fClientMap[Integer(Recipient)] then
+        begin
+          // check if there is a place in the message queue, if not, wait for it
+          WaitMessageSlots(False);
+        {
+          Check recipient validity again (it might have been destroyed during
+          the wait for a free msg slot).
+        }
+          If fClientMap[Integer(Recipient)] then
+            begin  
+              MessageItemPtr := GetMessageArrayItemPtr(AddMessage(TempMessage));
+              WakeClient(Integer(Recipient),SM_CLIENTFLAG_RECVSMSG);
+              // wait for message processing, also process incoming sent messages
+              while MessageItemPtr^.Flags and SM_MSGFLAG_RELEASED = 0 do
+                begin
+                  fSharedMemory.Unlock;
+                  try
+                    fSynchronizer.WaitFor; // infinite wait
+                    If lmrSentMessage in FetchMessages then
+                      DispatchSentMessages;
+                  finally
+                    fSharedMemory.Lock;
+                  end;
+                end;
+              // get result and remove the message
+              If MessageItemPtr^.Flags and SM_MSGFLAG_PROCESSED <> 0 then
+                Result := TSMMessageResult(MessageItemPtr^.P1_Result)
+              else
+                Result := 0;
+              RemoveMessage(MessageItemPtr^.Index);
+            end;
+        end;
+    finally
+      fSharedMemory.Unlock;
+    end;
+  end
+// sending to itself
+else Result := DirectDispatchMessage(TempMessage);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleMessagesClient.SendBroadcast(Param1, Param2: TSMMessageParam): TSMMessageResult;
+var
+  TempMessage:          TSMShMemMessage;
+  DirectDispatchResult: TSMMEssageResult;
+  MasterMessagePtr:     PSMShMemMessage;
+  i:                    Integer;
+begin
+Result := 0;
+// first do direct dispatch
+TempMessage := ConstructMessage(fClientID,fClientID,SM_MSGFLAG_SENT or SM_MSGFLAG_BROADCAST,Param1,Param2,-1);
+DirectDispatchResult := DirectDispatchMessage(TempMessage);
+// and now the ugly stuff...
 fSharedMemory.Lock;
 try
-  If fClientMap[Integer(Recipient)] and (fShMemHead^.Messages.Count < fShMemHead^.MaxMessages) then
+  If fShMemHead^.Clients.Count > 1 then
     begin
-      TempMessage.Sender := fClientID;
-      TempMessage.Recipient := Recipient;
-      TempMessage.Flags := SM_MSGFLAG_SENT;
-      TempMessage.Timestamp := GetTimestamp;
-      TempMessage.Param1 := Param1;
-      TempMessage.Param2 := Param2;
-      TempMessage.LinkedMsg := -1;
-      MessageIndex := AddMessage(TempMessage);
-      WakeClient(Recipient,SM_CLIENTFLAG_RECVSMSG);
-      fSharedMemory.Unlock;
-      //self.fSynchronizer.wa
-      fSharedMemory.Lock;
-      Result := TSMMessageResult(GetMessageArrayItemPtr(MessageIndex)^.Param2);
-      RemoveMessage(MessageIndex);
-    end;
+      // first make sure we have enought message slots (number of clients - 1, plus one for master message)
+      WaitMessageSlots(True);
+      If fShMemHead^.Clients.Count > 1 then
+        begin
+          // add master message to the queue (prevent its fetching by setting fetched flag)
+          TempMessage := ConstructMessage(fClientID,CLIENTID_BROADCAST,
+            SM_MSGFLAG_SENT or SM_MSGFLAG_BROADCAST or SM_MSGFLAG_MASTER,
+            DirectDispatchResult,TSMMessageParam(Pred(fShMemHead^.Clients.Count)){minus self},-1);
+          MasterMessagePtr := GetMessageArrayItemPtr(AddMessage(TempMessage));
+          // create and add all submessages
+          TempMessage := ConstructMessage(fClientID,CLIENTID_BROADCAST,
+            SM_MSGFLAG_SENT or SM_MSGFLAG_BROADCAST,
+            Param1,Param2,MasterMessagePtr^.Index);
+          For i := LowClientIndex to HighClientIndex do
+            If (i <> Integer(fClientID)) and fClientMap[i] then
+              begin
+                TempMessage.Recipient := TSMClientID(i);
+                AddMessage(TempMessage);
+                WakeClient(Integer(TempMessage.Recipient),SM_CLIENTFLAG_RECVSMSG);
+              end;
+          // wait on master message
+          while MasterMessagePtr^.Flags and SM_MSGFLAG_RELEASED = 0 do
+            begin
+              fSharedMemory.Unlock;
+              try
+                fSynchronizer.WaitFor; // infinite wait
+                If lmrSentMessage in FetchMessages then
+                  DispatchSentMessages;
+              finally
+                fSharedMemory.Lock;
+              end;
+            end;
+          // get result and remove the master message
+          Result := TSMMessageResult(MasterMessagePtr^.P1_Result);
+          RemoveMessage(MasterMessagePtr^.Index);
+        end
+      else Result := DirectDispatchResult;
+    end
+  else Result := DirectDispatchResult;
 finally
   fSharedMemory.Unlock;
 end;
-*)
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.SendBroadcast(Param1, Param2: TSMMessageParam): TSMMessageResult;
-begin
-{$message 'todo'}
-Result := 0;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TSimpleMessageClient.PostSinglecast(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): Boolean;
+Function TSimpleMessagesClient.PostSinglecast(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): Boolean;
 var
   TempMessage:  TSMShMemMessage;
 begin
@@ -726,13 +866,7 @@ try
   // continue only if the recipient exists and there is a room for the message
   If fClientMap[Integer(Recipient)] and (fShMemHead^.Messages.Count < fShMemHead^.MaxMessages) then
     begin
-      TempMessage.Sender := fClientID;
-      TempMessage.Recipient := Recipient;
-      TempMessage.Flags := 0;
-      TempMessage.Timestamp := GetTimestamp;
-      TempMessage.P1_Result := Param1;
-      TempMessage.P2_Counter := Param2;
-      TempMessage.MasterMsg := -1;
+      TempMessage := ConstructMessage(fClientID,Recipient,0,Param1,Param2,-1);
       AddMessage(TempMessage);
       WakeClient(Integer(Recipient),SM_CLIENTFLAG_RECVPMSG);
       Result := True;
@@ -744,7 +878,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.PostBroadcast(Param1, Param2: TSMMessageParam): Boolean;
+Function TSimpleMessagesClient.PostBroadcast(Param1, Param2: TSMMessageParam): Boolean;
 var
   TempMessage:  TSMShMemMessage;
   i:            Integer;
@@ -755,12 +889,7 @@ try
   If (fShMemHead^.Clients.Count > 0) and
      (fShMemHead^.Clients.Count <= (fShMemHead^.MaxMessages - fShMemHead^.Messages.Count)) then
     begin
-      TempMessage.Sender := fClientID;
-      TempMessage.Flags := SM_MSGFLAG_BROADCAST;
-      TempMessage.Timestamp := GetTimestamp;
-      TempMessage.P1_Result := Param1;
-      TempMessage.P2_Counter := Param2;
-      TempMessage.MasterMsg := -1;
+      TempMessage := ConstructMessage(fClientID,CLIENTID_BROADCAST,SM_MSGFLAG_BROADCAST,Param1,Param2,-1);
       For i := LowClientIndex to HighClientIndex do
         If fClientMap[i] then // does this client exist?
           begin
@@ -777,7 +906,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.WaitMessages(Timeout: UInt32): Boolean;
+Function TSimpleMessagesClient.WaitMessages(Timeout: UInt32): Boolean;
 
   Function CheckMessages: Boolean;
   begin
@@ -825,7 +954,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.FetchMessages: TMSFetchMessagesResults;
+Function TSimpleMessagesClient.FetchMessages: TSMFetchMessagesResults;
 var
   MessageIndex:   TSMMessageIndex;
   MessageItemPtr: PSMShMemMessage;
@@ -847,7 +976,18 @@ try
                   fFetchedPostedMessages.Add(MessageItemPtr^);
                   RemoveMessage(MessageItemPtr^.Index);
                 end
-              else fFetchedSentMessages.Add(MessageItemPtr^); // sent mesages are not deleted
+              else
+                begin
+                  // sent message (must not be master or fetched)
+                  If (MessageItemPtr^.Flags and SM_MSGFLAG_FETCHED = 0) and
+                     (MessageItemPtr^.Flags and SM_MSGFLAG_MASTER = 0) then
+                    begin
+                      MessageItemPtr^.Flags := MessageItemPtr^.Flags or SM_MSGFLAG_FETCHED;
+                      fFetchedSentMessages.Add(MessageItemPtr^);
+                      If MessageItemPtr^.Flags and SM_MSGFLAG_BROADCAST <> 0 then
+                        RemoveMessage(MessageItemPtr^.Index);
+                    end;
+                end;
             end;
         end;
       fShMemClient^.Flags := fShMemClient^.Flags and not SM_CLIENTFLAG_RECVMSG;
@@ -867,14 +1007,35 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.DispatchSentMessages;
+Function TSimpleMessagesClient.DirectDispatchMessage(var Msg: TSMShMemMessage): TSMMessageResult;
+var
+  TempMessage:    TSMMessage;
+  DispatchFlags:  TSMDispatchFlags;
+begin
+If Assigned(fOnMessageEvent) or Assigned(fOnMessageCallback) then
+  begin
+    TempMessage.Sender := Msg.Sender;
+    TempMessage.Param1 := Msg.P1_Result;
+    TempMessage.Param2 := Msg.P2_Counter;
+    TempMessage.Result := 0;
+    DispatchFlags := [dfSentMessage,dfDirectDispatch];
+    If Msg.Flags and SM_MSGFLAG_BROADCAST <> 0 then
+      Include(DispatchFlags,dfBroadcastedMessage);
+    DoMessage(TempMessage,DispatchFlags); // <<<
+    Result := TempMessage.Result;
+  end
+else Result := 0;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSimpleMessagesClient.DispatchSentMessages;
 var
   TempShMemMessage: TSMShMemMessage;
   TempMessage:      TSMMessage;
   DispatchFlags:    TSMDispatchFlags;
   i:                Integer;
 begin
-exit;
 If Assigned(fOnMessageEvent) or Assigned(fOnMessageCallback) then
   begin
     while fFetchedSentMessages.Count > 0 do
@@ -891,8 +1052,10 @@ If Assigned(fOnMessageEvent) or Assigned(fOnMessageCallback) then
         DoMessage(TempMessage,DispatchFlags); // <<<
         fSharedMemory.Lock;
         try
-          GetMessageArrayItemPtr(TempShMemMessage.Index)^.P1_Result := TempMessage.Result;
-          ReleaseSentMessage(TempShMemMessage.Index,True);
+          If TempShMemMessage.Flags and SM_MSGFLAG_BROADCAST <> 0 then
+            ReleaseSentMessage(TempShMemMessage.MasterMsg,True,TempMessage.Result)
+          else
+            ReleaseSentMessage(TempShMemMessage.Index,True,TempMessage.Result);
         finally
           fSharedMemory.Unlock;
         end;
@@ -905,7 +1068,10 @@ else
     fSharedMemory.Lock;
     try
       For i := fFetchedSentMessages.LowIndex to fFetchedSentMessages.HighIndex do
-        ReleaseSentMessage(fFetchedSentMessages[i].Index,False);
+        If fFetchedSentMessages[i].Flags and SM_MSGFLAG_BROADCAST <> 0 then
+          ReleaseSentMessage(fFetchedSentMessages[i].MasterMsg,False,0)
+        else
+          ReleaseSentMessage(fFetchedSentMessages[i].Index,False,0);
     finally
       fSharedMemory.Unlock;
     end;
@@ -915,7 +1081,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.DispatchPostedMessages;
+procedure TSimpleMessagesClient.DispatchPostedMessages;
 var
   TempShMemMessage: TSMShMemMessage;
   TempMessage:      TSMMessage;
@@ -944,7 +1110,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.InternalPeekMessages: Boolean;
+Function TSimpleMessagesClient.InternalPeekMessages: Boolean;
 begin
 If FetchMessages <> [] then
   begin
@@ -957,7 +1123,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.DoMessage(var Msg: TSMMessage; var Flags: TSMDispatchFlags);
+procedure TSimpleMessagesClient.DoMessage(var Msg: TSMMessage; var Flags: TSMDispatchFlags);
 begin
 If Assigned(fOnMessageEvent) then
   fOnMessageEvent(Self,Msg,Flags)
@@ -967,7 +1133,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.Initialize(MaxClients,MaxMessages: Integer; const NameSpace: String);
+procedure TSimpleMessagesClient.Initialize(MaxClients,MaxMessages: Integer; const NameSpace: String);
 var
   MapFreeIdx:     Integer;
   MessageItemPtr: PSMShMemMessage;
@@ -976,9 +1142,9 @@ var
 begin
 // sanity checks
 If (MaxClients <= 0) or (MaxClients >= CLIENTID_BROADCAST) then
-  raise ESMInvalidValue.CreateFmt('TSimpleMessageClient.Initialize: Invalid client limit (%d).',[MaxClients]);
-If (MaxMessages <= 0) or (MaxMessages <= MaxClients) then
-  raise ESMInvalidValue.CreateFmt('TSimpleMessageClient.Initialize: Invalid message limit (%d).',[MaxMessages]);
+  raise ESMInvalidValue.CreateFmt('TSimpleMessagesClient.Initialize: Invalid client limit (%d).',[MaxClients]);
+If (MaxMessages <= 0) or (MaxMessages < MaxClients) then
+  raise ESMInvalidValue.CreateFmt('TSimpleMessagesClient.Initialize: Invalid message limit (%d).',[MaxMessages]);
 // create shared memory
 fSharedMemory := TSharedMemory.Create(
   // calculate expected shared memory size...
@@ -995,10 +1161,10 @@ try
       fIsFounder := False;
       // not a first access to this memory, check limits
       If fShMemHead^.MaxClients <> MaxClients then
-        raise ESMLimitMismatch.CreateFmt('TSimpleMessageClient.Initialize: Client limit does not match (%d/%d).',
+        raise ESMLimitMismatch.CreateFmt('TSimpleMessagesClient.Initialize: Client limit does not match (%d/%d).',
           [MaxClients,fShMemHead^.MaxClients]);
       If fShMemHead^.MaxMessages <> MaxMessages then
-        raise ESMLimitMismatch.CreateFmt('TSimpleMessageClient.Initialize: Message limit does not match (%d/%d).',
+        raise ESMLimitMismatch.CreateFmt('TSimpleMessagesClient.Initialize: Message limit does not match (%d/%d).',
           [MaxMessages,fShMemHead^.MaxMessages]);
     end
   else
@@ -1049,14 +1215,14 @@ try
       fShMemClient := GetClientArrayItemPtr(MapFreeIdx);
       fShMemClient^.Flags := 0;
       If CreateGUID(fShMemClient^.Identifier) <> S_OK then
-        raise ESMOutOfResources.Create('TSimpleMessageClient.Initialize: Cannot generate client GUID.');
+        raise ESMOutOfResources.Create('TSimpleMessagesClient.Initialize: Cannot generate client GUID.');
       fShMemClient^.ProcessID := GetCurrentProcessID;
       fShMemClient^.Synchronizer := TSMCrossHandle(fSynchronizer.Handle);
-      Inc(fShMemHead^.Clients.Count);
       fClientMap[MapFreeIdx] := True;
+      Inc(fShMemHead^.Clients.Count);
       fClientID := TSMClientID(MapFreeIdx);
     end
-  else raise ESMOutOfResources.Create('TSimpleMessageClient.Initialize: No free client slot.');
+  else raise ESMOutOfResources.Create('TSimpleMessagesClient.Initialize: No free client slot.');
   // client synchronizers (make sure they are properly initialized)
   SetLength(fClientSyncs,MaxClients);
   For j := LowClientIndex to HighClientIndex do
@@ -1073,106 +1239,123 @@ try
         fClientSyncs[j].Synchronizer := fSynchronizer;
       end;
   // vectors for received messages
-  fFetchedSentMessages := TMSMessageVector.Create;
-  fFetchedPostedMessages := TMSMessageVector.Create;
+  fFetchedSentMessages := TSMMessageVector.Create;
+  fFetchedPostedMessages := TSMMessageVector.Create;
 finally
   fSharedMemory.Unlock;
 end;
+fFullyInitialized := True;
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.Finalize;
+procedure TSimpleMessagesClient.Finalize;
 var
   i:  Integer;
 begin
-fSharedMemory.Lock;
-try
-  // get and release all sent messages (also remove the posted ones)
-  FetchMessages;
-  For i := fFetchedSentMessages.LowIndex to fFetchedSentMessages.HighIndex do
-    ReleaseSentMessage(fFetchedSentMessages[i].Index,False);
-  // free message vectors
-  fFetchedPostedMessages.Free;
-  fFetchedSentMessages.Free;
-  // free synchronizers
-  For i := LowClientIndex to HighClientIndex do
-    If fClientSyncs[i].Assigned and (i <> Integer(fClientID)) then
-      fClientSyncs[i].Synchronizer.Free;
-  // remove self from clients
-  fClientMap[Integer(fClientID)] := False;
-  Dec(fShMemHead^.Clients.Count);
-  // cleanup
-  fSynchronizer.Free;
-  fClientMap.Free;
-finally
-  fSharedMemory.Unlock;
-end;
-fSharedMemory.Free;
+If Assigned(fSharedMemory) then
+  begin
+    fSharedMemory.Lock;
+    try
+      If fFullyInitialized then
+        begin
+          // get and release all sent messages (also remove the posted ones)
+          FetchMessages;
+          For i := fFetchedSentMessages.LowIndex to fFetchedSentMessages.HighIndex do   
+            If fFetchedSentMessages[i].Flags and SM_MSGFLAG_BROADCAST <> 0 then
+              ReleaseSentMessage(fFetchedSentMessages[i].MasterMsg,False,0)
+            else
+              ReleaseSentMessage(fFetchedSentMessages[i].Index,False,0);
+          // free synchronizers (do not use Low/HighClientIndex)
+          For i := LowClientIndex to HighClientIndex do
+            If fClientSyncs[i].Assigned and (i <> Integer(fClientID)) then
+              fClientSyncs[i].Synchronizer.Free;
+          // remove self from clients
+          fShMemClient^.Flags := 0;  // to be sure
+          fClientMap[Integer(fClientID)] := False;
+          Dec(fShMemHead^.Clients.Count);
+        end;
+      // cleanup
+      fFetchedPostedMessages.Free;
+      fFetchedSentMessages.Free;
+      fSynchronizer.Free;
+      fClientMap.Free;
+    finally
+      fSharedMemory.Unlock;
+    end;
+    fSharedMemory.Free;
+  end;
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.LowClientIndex: Integer;
+Function TSimpleMessagesClient.LowClientIndex: Integer;
 begin
 Result := 0;
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.HighClientIndex: Integer;
+Function TSimpleMessagesClient.HighClientIndex: Integer;
 begin
 Result := Pred(fShMemHead^.MaxClients);
 end;
  
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.CheckClientIndex(ClientIndex: Integer): Boolean;
+Function TSimpleMessagesClient.CheckClientIndex(ClientIndex: Integer): Boolean;
 begin
 Result := (ClientIndex >= LowClientIndex) and (ClientIndex <= HighClientIndex);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.CheckClientID(ClientID: TSMClientID): Boolean;
+Function TSimpleMessagesClient.CheckClientID(ClientID: TSMClientID): Boolean;
 begin
 Result := CheckClientIndex(Integer(ClientID)) or (ClientID = CLIENTID_BROADCAST);
 end;
  
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.LowMessageIndex: TSMMessageIndex;
+Function TSimpleMessagesClient.LowMessageIndex: TSMMessageIndex;
 begin
 Result := 0;
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.HighMessageIndex: TSMMessageIndex;
+Function TSimpleMessagesClient.HighMessageIndex: TSMMessageIndex;
 begin
 Result := Pred(fShMemHead^.MaxMessages);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.CheckMessageIndex(MessageIndex: TSMMessageIndex): Boolean;
+Function TSimpleMessagesClient.CheckMessageIndex(MessageIndex: TSMMessageIndex): Boolean;
 begin
 Result := (MessageIndex >= LowMessageIndex) and (MessageIndex <= HighMessageIndex);
 end;
 
 {-------------------------------------------------------------------------------
-    TSimpleMessageClient - public methods
+    TSimpleMessagesClient - public methods
 -------------------------------------------------------------------------------}
 
-constructor TSimpleMessageClient.Create(MaxClients: Integer = SM_MAXCLIENTS_DEF; MaxMessages: Integer = SM_MAXMESSAGES_DEF; const NameSpace: String = '');
+constructor TSimpleMessagesClient.Create(MaxClients: Integer = SM_MAXCLIENTS_DEF; MaxMessages: Integer = SM_MAXMESSAGES_DEF; const NameSpace: String = '');
 begin
 inherited Create;
 Initialize(MaxClients,MaxMessages,NameSpace);
 end;
 
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TSimpleMessagesClient.Create(const NameSpace: String);
+begin
+Create(SM_MAXCLIENTS_DEF,SM_MAXMESSAGES_DEF,NameSpace);
+end;
+
 //------------------------------------------------------------------------------
 
-destructor TSimpleMessageClient.Destroy;
+destructor TSimpleMessagesClient.Destroy;
 begin
 Finalize;
 inherited;
@@ -1180,7 +1363,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.SendMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): TSMMessageResult;
+Function TSimpleMessagesClient.SendMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): TSMMessageResult;
 begin
 If CheckClientID(Recipient) then
   begin
@@ -1194,7 +1377,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleMessageClient.PostMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): Boolean;
+Function TSimpleMessagesClient.PostMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): Boolean;
 begin
 If CheckClientID(Recipient) then
   begin
@@ -1208,7 +1391,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.GetMessages(Timeout: UInt32 = INFINITE);
+procedure TSimpleMessagesClient.GetMessages(Timeout: UInt32 = INFINITE);
 begin
 // enter waiting only if there is no message already received
 If not InternalPeekMessages then
@@ -1218,10 +1401,25 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleMessageClient.PeekMessages;
+procedure TSimpleMessagesClient.PeekMessages;
 begin
 InternalPeekMessages;
 end;
 
+//------------------------------------------------------------------------------
+
+Function TSimpleMessagesClient.GetExtraInfo: TSMExtraInfo;
+begin
+fSharedMemory.Lock;
+try
+  Result.ClientCount := fShMemHead^.Clients.Count;
+  Result.MaxClients := fShMemHead^.MaxClients;
+  Result.MessageCount := fShMemHead^.Messages.Count;
+  Result.MaxMessages := fShMemHead^.MaxMessages;
+  Result.SharedMemorySize := fSharedMemory.Size;
+finally
+  fSharedMEmory.Unlock;
+end;
+end;
 
 end.
