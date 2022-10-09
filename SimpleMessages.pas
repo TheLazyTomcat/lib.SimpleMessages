@@ -1,3 +1,93 @@
+{-------------------------------------------------------------------------------
+
+  This Source Code Form is subject to the terms of the Mozilla Public
+  License, v. 2.0. If a copy of the MPL was not distributed with this
+  file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+-------------------------------------------------------------------------------}
+{===============================================================================
+
+  Simple messages
+
+    This unit provides means of simple inter-thread and also inter-process
+    message-based communication.
+
+    It was created for use in Linux as a functional replacement of Windows
+    message system (SendMessage, PostMessage, GetMessage, ...).
+
+    There are, at this point, no performance optimizations in place, therefore
+    its use should be limited only to sporadic notifications and exchange of
+    very small amount of data (what can fit into the parameters).
+
+    Both asynchronous (PostMessage) and synchronous (SendMessage) sending is
+    fully supported.
+
+      WARNING - sending a message from handler that is processing received
+                synchronous (sent) message is possible, but it creates a
+                complex indirect recursion. This, when not checked, can lead to
+                a stack overflow. Be aware of this.
+
+    To fetch and dispatch/process any incoming messages, call PeekMessages
+    (non-blocking) or GetMessages (blocks until a message it received or a
+    given timeout elapses).
+
+    Also, there are two ways how to use this unit - either create an instance
+    of TSimpleMessagesClient class and call its methods, or use provided
+    procedural interface (standalone functions InitMessages, SendMessage, ...).
+
+    For more information on this unit, contact the author or consult with the
+    source code.
+
+  Version 1.0 alpha - requires extensive testing (2022-10-09)
+
+  Last change 2022-10-09
+
+  ©2022 František Milt
+
+  Contacts:
+    František Milt: frantisek.milt@gmail.com
+
+  Support:
+    If you find this code useful, please consider supporting its author(s) by
+    making a small donation using the following link(s):
+
+      https://www.paypal.me/FMilt
+
+  Changelog:
+    For detailed changelog and history please refer to this git repository:
+
+      github.com/TheLazyTomcat/Lib.SimpleMessages
+
+  Dependencies:
+    AuxClasses         - github.com/TheLazyTomcat/Lib.AuxClasses
+    AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
+    BitOps             - github.com/TheLazyTomcat/Lib.BitOps
+    BitVector          - github.com/TheLazyTomcat/Lib.BitVector
+    HashBase           - github.com/TheLazyTomcat/Lib.HashBase
+    InterlockedOps     - github.com/TheLazyTomcat/Lib.InterlockedOps
+  * LinSyncObjs        - github.com/TheLazyTomcat/Lib.LinSyncObjs
+    ListSorters        - github.com/TheLazyTomcat/Lib.ListSorters
+    MemVector          - github.com/TheLazyTomcat/Lib.MemVector 
+    NamedSharedItems   - github.com/TheLazyTomcat/Lib.NamedSharedItems
+    SHA1               - github.com/TheLazyTomcat/Lib.SHA1
+    SharedMemoryStream - github.com/TheLazyTomcat/Lib.SharedMemoryStream
+  * SimpleCPUID        - github.com/TheLazyTomcat/Lib.SimpleCPUID
+  * SimpleFutex        - github.com/TheLazyTomcat/Lib.SimpleFutex
+    StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
+    StrRect            - github.com/TheLazyTomcat/Lib.StrRect
+  * UInt64Utils        - github.com/TheLazyTomcat/Lib.UInt64Utils
+  * WinSyncObjs        - github.com/TheLazyTomcat/Lib.WinSyncObjs
+
+  Libraries UInt64Utils and WinSyncObjs are required only when compiling for
+  Windows OS.
+
+  Libraries LinSyncObjs and SimpleFutex are required only when compiling for
+  Linux OS.
+
+  Library SimpleCPUID might not be required when compiling for Windows OS,
+  depending on defined symbols in InterlockedOps and BitOps libraries.  
+
+===============================================================================}
 unit SimpleMessages;
 
 {$IF Defined(WINDOWS) or Defined(MSWINDOWS)}
