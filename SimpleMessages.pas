@@ -20,7 +20,12 @@ interface
 
 uses
   SysUtils,
-  AuxTypes, AuxClasses, WinSyncObjs, SharedMemoryStream, BitVector, MemVector;
+  AuxTypes, AuxClasses, BitVector, MemVector, SharedMemoryStream,
+{$IFDEF Windows}
+  WinSyncObjs
+{$ELSE}
+  LinSyncObjs
+{$ENDIF};
 
 {===============================================================================
     Library-specific exceptions
@@ -33,6 +38,7 @@ type
   ESMLimitMismatch    = class(ESMException);
   ESMOutOfResources   = class(ESMException);
   ESMIndexOutOfBounds = class(ESMException);
+  ESMNoMessageClient  = class(ESMException);
 
 {===============================================================================
     Common types and constants
@@ -72,18 +78,22 @@ const
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 type
   TSMExtraInfo = record
-    ClientCount:      Integer;
-    MaxClients:       Integer;
-    MessageCount:     Integer;
-    MaxMessages:      Integer;
-    SharedMemorySize: TMemSize;
+    ClientCount:                Integer;
+    MaxClients:                 Integer;
+    MessageCount:               Integer;
+    MaxMessages:                Integer;
+    SharedMemorySize:           TMemSize;
+    FetchedSentMessagesCount:   Integer;
+    FetchedPostedMessagesCount: Integer;
   end;       
 
 {-------------------------------------------------------------------------------
     Common types and constants - internal
 -------------------------------------------------------------------------------}
 type
+{$IFDEF Windows}
   TSMCrossHandle = UInt64;
+{$ENDIF}
 
   TSMMessageIndex     = Int32;
   TSMMessageFlags     = UInt32;
@@ -125,9 +135,13 @@ type
 type
   TSMShMemClient = packed record
     Flags:        UInt32;
+  {$IFDEF Windows}
     Identifier:   TGUID;
     ProcessID:    DWORD;
     Synchronizer: TSMCrossHandle;
+  {$ELSE}
+    Synchronizer: TLSOSimpleEvent;
+  {$ENDIF}
   end;
   PSMShMemClient = ^TSMShMemClient;
 
@@ -146,6 +160,7 @@ type
   end;
   PSMShMemMessage = ^TSMShMemMessage;
 
+{$IFDEF Windows}
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 type
   TSMClientSynchonizer = record
@@ -155,7 +170,7 @@ type
   end;
 
   TSMClientSynchonizers = array of TSMClientSynchonizer;
-
+{$ENDIF}
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 type
   TSMFetchMessagesResult = (lmrSentMessage,lmrPostedMessage);
@@ -209,10 +224,12 @@ type
     fShMemClientArr:        Pointer;
     fShMemMessageArr:       Pointer;
     fClientMap:             TBitVectorStatic;
-    fSynchronizer:          TEvent;
+    fSynchronizer:          {$IFDEF Windows}TEvent{$ELSE}PLSOSimpleEvent{$ENDIF};
     fFetchedSentMessages:   TSMMessageVector;
     fFetchedPostedMessages: TSMMessageVector;
+  {$IFDEF Windows}
     fClientSyncs:           TSMClientSynchonizers;
+  {$ENDIF}
     fFullyInitialized:      Boolean;
     fOnMessageEvent:        TSMMessageEvent;
     fOnMessageCallback:     TSMMessageCallback;
@@ -252,8 +269,8 @@ type
     Function HighMessageIndex: TSMMessageIndex; virtual;
     Function CheckMessageIndex(MessageIndex: TSMMessageIndex): Boolean; virtual;
   public
-    constructor Create(MaxClients: Integer = SM_MAXCLIENTS_DEF; MaxMessages: Integer = SM_MAXMESSAGES_DEF; const NameSpace: String = ''); overload;
-    constructor Create(const NameSpace: String); overload;
+    constructor Create(MaxClients,MaxMessages: Integer; const NameSpace: String = ''); overload;
+    constructor Create(const NameSpace: String = ''); overload;
     destructor Destroy; override;
     Function SendMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): TSMMessageResult; virtual;
     Function PostMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): Boolean; virtual;
@@ -267,24 +284,40 @@ type
     property OnMessage: TSMMessageEvent read fOnMessageEvent write fOnMessageEvent;
   end;
 
-(*
-threadvar
-  ThreadMessageClient
+{===============================================================================
+--------------------------------------------------------------------------------
+                              Procedural interface
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    Procedural interface - declaration
+===============================================================================}
 
-InitMessages(Handler)
-FinalMessages
+procedure InitMessages(Handler: TSMMessageCallback; MaxClients,MaxMessages: Integer; const NameSpace: String = ''); overload;
+procedure InitMessages(Handler: TSMMessageEvent; MaxClients,MaxMessages: Integer; const NameSpace: String = ''); overload;
+procedure InitMessages(Handler: TSMMessageCallback; const NameSpace: String = ''); overload;
+procedure InitMessages(Handler: TSMMessageEvent; const NameSpace: String = ''); overload;
 
-SendMessage
-PostMessage
-GetMessages(Timeout)
-PeekMessages
-*)
+procedure FinalMessages;
+
+procedure SetMessageHandler(Handler: TSMMessageCallback); overload;
+procedure SetMessageHandler(Handler: TSMMessageEvent); overload;
+
+Function ActiveMessages: Boolean;
+
+//------------------------------------------------------------------------------
+
+Function SendMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): TSMMessageResult;
+Function PostMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): Boolean;
+
+procedure GetMessages(Timeout: UInt32 = INFINITE);
+procedure PeekMessages;
 
 
 implementation
 
 uses
-  Windows, Math;
+  {$IFDEF Windows}Windows,{$ELSE}BaseUnix, Linux,{$ENDIF} Math;
 
 {$IFDEF FPC_DisableWarns}
   {$DEFINE FPCDWM}
@@ -296,7 +329,12 @@ uses
 ===============================================================================}
 
 Function GetTimestamp: TSMMessageTimestamp;
-{$IFNDEF Windows}
+{$IFDEF Windows}
+begin
+Result := 0;
+If not QueryPerformanceCounter(Result) then
+  raise ESMSystemError.CreateFmt('GetTimestamp: Cannot obtain time stamp (%d).',[GetLastError]);
+{$ELSE}
 var
   Time: TTimeSpec;
 begin
@@ -304,11 +342,6 @@ If clock_gettime(CLOCK_MONOTONIC_RAW,@Time) = 0 then
   Result := (Int64(Time.tv_sec) * 1000000000) + Time.tv_nsec
 else
   raise ESMSystemError.CreateFmt('GetTimestamp: Cannot obtain time stamp (%d).',[errno]);
-{$ELSE}
-begin
-Result := 0;
-If not QueryPerformanceCounter(Result) then
-  raise ESMSystemError.CreateFmt('GetTimestamp: Cannot obtain time stamp (%d).',[GetLastError]);
 {$ENDIF}
 Result := Result and $7FFFFFFFFFFFFFFF; // mask out sign bit
 end;
@@ -657,6 +690,7 @@ procedure TSimpleMessagesClient.WakeClient(ClientIndex: Integer; SetFlags: UInt3
 var
   ClientItemPtr:  PSMShMemClient;
 
+{$IFDEF Windows}
   procedure DuplicateClientSynchronizer;
   begin
     fClientSyncs[ClientIndex].Assigned := True;
@@ -664,11 +698,13 @@ var
     fClientSyncs[ClientIndex].Synchronizer :=
       TEvent.DuplicateFromProcessID(ClientItemPtr^.ProcessID,THandle(ClientItemPtr^.Synchronizer));
   end;
+{$ENDIF}
 
 begin
 If CheckClientIndex(ClientIndex) then
   begin
     ClientItemPtr := GetClientArrayItemPtr(ClientIndex);
+  {$IFDEF Windows}
     If fClientSyncs[ClientIndex].Assigned then
       begin
         If not IsEqualGUID(fClientSyncs[ClientIndex].Identifier,ClientItemPtr^.Identifier) then
@@ -678,9 +714,14 @@ If CheckClientIndex(ClientIndex) then
           end;
       end
     else DuplicateClientSynchronizer;
+  {$ENDIF}
     // set flags and release the event
     ClientItemPtr^.Flags := ClientItemPtr^.Flags or SetFlags;
+  {$IFDEF Windows}
     fClientSyncs[ClientIndex].Synchronizer.SetEvent;
+  {$ELSE}
+    event_auto_unlock(Addr(GetClientArrayItemPtr(ClientIndex)^.Synchronizer));
+  {$ENDIF}
   end
 else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.WakeClient: Client index (%d) out of bounds.',[ClientIndex]);
 end;
@@ -733,7 +774,11 @@ If fShMemHead^.MaxMessages < (fShMemHead^.Messages.Count + TrueReqCount) then
         fShMemHead^.Clients.Flags := fShMemHead^.Clients.Flags or SM_CLIENTSFLAG_MSGSLTWT;
         fSharedMemory.Unlock;
         try
+        {$IFDEF Windows}
           fSynchronizer.WaitFor; // infinite wait
+        {$ELSE}
+          event_auto_wait(fSynchronizer);
+        {$ENDIF}
         finally
           fSharedMemory.Lock;
         end;
@@ -782,7 +827,11 @@ If Recipient <> fClientID then
                 begin
                   fSharedMemory.Unlock;
                   try
+                  {$IFDEF Windows}
                     fSynchronizer.WaitFor; // infinite wait
+                  {$ELSE}
+                    event_auto_wait(fSynchronizer);
+                  {$ENDIF}
                     If lmrSentMessage in FetchMessages then
                       DispatchSentMessages;
                   finally
@@ -847,7 +896,11 @@ try
             begin
               fSharedMemory.Unlock;
               try
+              {$IFDEF Windows}
                 fSynchronizer.WaitFor; // infinite wait
+              {$ELSE}
+                event_auto_wait(fSynchronizer);
+              {$ENDIF}
                 If lmrSentMessage in FetchMessages then
                   DispatchSentMessages;
               finally
@@ -942,7 +995,11 @@ TimeoutRemaining := Timeout;
 If (fFetchedSentMessages.Count <= 0) and (fFetchedPostedMessages.Count <= 0) then
   repeat
     ExitWait := True;
+  {$IFDEF Windows}
     If fSynchronizer.WaitFor(TimeoutRemaining) in [wrSignaled,wrAbandoned,wrIOCompletion,wrMessage] then
+  {$ELSE}
+    If event_auto_timedwait(fSynchronizer,TimeoutRemaining) = 0 then
+  {$ENDIF}
       begin
         If not CheckMessages then
           begin
@@ -1150,7 +1207,9 @@ var
   MapFreeIdx:     Integer;
   MessageItemPtr: PSMShMemMessage;
   i:              TSMMessageIndex;
+{$IFDEF Windows}
   j:              Integer;
+{$ENDIF}
 begin
 // sanity checks
 If (MaxClients <= 0) or (MaxClients >= CLIENTID_BROADCAST) then
@@ -1225,18 +1284,26 @@ try
   MapFreeIdx := fClientMap.FirstClean;
   If fClientMap.CheckIndex(MapFreeIdx) then
     begin
+    {$IFDEF Windows}
       fSynchronizer := TEvent.Create(False,False);
+    {$ENDIF}
       fShMemClient := GetClientArrayItemPtr(MapFreeIdx);
       fShMemClient^.Flags := 0;
+    {$IFDEF Windows}
       If CreateGUID(fShMemClient^.Identifier) <> S_OK then
         raise ESMOutOfResources.Create('TSimpleMessagesClient.Initialize: Cannot generate client GUID.');
       fShMemClient^.ProcessID := GetCurrentProcessID;
       fShMemClient^.Synchronizer := TSMCrossHandle(fSynchronizer.Handle);
+    {$ELSE}
+      fSynchronizer := Addr(fShMemClient^.Synchronizer);
+      event_auto_init(fSynchronizer);
+    {$ENDIF}
       fClientMap[MapFreeIdx] := True;
       Inc(fShMemHead^.Clients.Count);
       fClientID := TSMClientID(MapFreeIdx);
     end
   else raise ESMOutOfResources.Create('TSimpleMessagesClient.Initialize: No free client slot.');
+{$IFDEF Windows}
   // client synchronizers (make sure they are properly initialized)
   SetLength(fClientSyncs,MaxClients);
   For j := LowClientIndex to HighClientIndex do
@@ -1252,6 +1319,7 @@ try
         fClientSyncs[j].Identifier := fShMemClient^.Identifier;
         fClientSyncs[j].Synchronizer := fSynchronizer;
       end;
+{$ENDIF}
   // vectors for received messages
   fFetchedSentMessages := TSMMessageVector.Create;
   fFetchedPostedMessages := TSMMessageVector.Create;
@@ -1280,10 +1348,12 @@ If Assigned(fSharedMemory) then
               ReleaseSentMessage(fFetchedSentMessages[i].MasterMsg,False,0)
             else
               ReleaseSentMessage(fFetchedSentMessages[i].Index,False,0);
+        {$IFDEF Windows}
           // free synchronizers (do not use Low/HighClientIndex)
           For i := LowClientIndex to HighClientIndex do
             If fClientSyncs[i].Assigned and (i <> Integer(fClientID)) then
               fClientSyncs[i].Synchronizer.Free;
+        {$ENDIF}
           // remove self from clients
           fShMemClient^.Flags := 0;  // to be sure
           fClientMap[Integer(fClientID)] := False;
@@ -1292,7 +1362,11 @@ If Assigned(fSharedMemory) then
       // cleanup
       fFetchedPostedMessages.Free;
       fFetchedSentMessages.Free;
+    {$IFDEF Windows}
       fSynchronizer.Free;
+    {$ELSE}
+      event_auto_destroy(fSynchronizer);
+    {$ENDIF}
       fClientMap.Free;
     finally
       fSharedMemory.Unlock;
@@ -1354,7 +1428,7 @@ end;
     TSimpleMessagesClient - public methods
 -------------------------------------------------------------------------------}
 
-constructor TSimpleMessagesClient.Create(MaxClients: Integer = SM_MAXCLIENTS_DEF; MaxMessages: Integer = SM_MAXMESSAGES_DEF; const NameSpace: String = '');
+constructor TSimpleMessagesClient.Create(MaxClients,MaxMessages: Integer; const NameSpace: String = '');
 begin
 inherited Create;
 Initialize(MaxClients,MaxMessages,NameSpace);
@@ -1362,7 +1436,7 @@ end;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-constructor TSimpleMessagesClient.Create(const NameSpace: String);
+constructor TSimpleMessagesClient.Create(const NameSpace: String = '');
 begin
 Create(SM_MAXCLIENTS_DEF,SM_MAXMESSAGES_DEF,NameSpace);
 end;
@@ -1431,9 +1505,137 @@ try
   Result.MessageCount := fShMemHead^.Messages.Count;
   Result.MaxMessages := fShMemHead^.MaxMessages;
   Result.SharedMemorySize := fSharedMemory.Size;
+  Result.FetchedSentMessagesCount := fFetchedSentMessages.Count;
+  Result.FetchedPostedMessagesCount := fFetchedPostedMessages.Count;
 finally
   fSharedMEmory.Unlock;
 end;
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                              Procedural interface
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    Procedural interface - implementation
+===============================================================================}
+threadvar
+  ThreadMsgClient:  TSimpleMessagesClient;  // automatically initilaized to nil
+
+//------------------------------------------------------------------------------
+
+procedure InitMessages(Handler: TSMMessageCallback; MaxClients,MaxMessages: Integer; const NameSpace: String = '');
+begin
+If Assigned(ThreadMsgClient) then
+  FreeAndNil(ThreadMsgClient);
+ThreadMsgClient := TSimpleMessagesClient.Create(MaxClients,MaxMessages,NameSpace);
+ThreadMsgClient.OnMessageCallback := Handler;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure InitMessages(Handler: TSMMessageEvent; MaxClients,MaxMessages: Integer; const NameSpace: String = '');
+begin
+If Assigned(ThreadMsgClient) then
+  FreeAndNil(ThreadMsgClient);
+ThreadMsgClient := TSimpleMessagesClient.Create(MaxClients,MaxMessages,NameSpace);
+ThreadMsgClient.OnMessageEvent := Handler;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure InitMessages(Handler: TSMMessageCallback; const NameSpace: String = '');
+begin
+InitMessages(Handler,SM_MAXCLIENTS_DEF,SM_MAXMESSAGES_DEF,NameSpace);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure InitMessages(Handler: TSMMessageEvent; const NameSpace: String = '');
+begin
+InitMessages(Handler,SM_MAXCLIENTS_DEF,SM_MAXMESSAGES_DEF,NameSpace);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure FinalMessages;
+begin
+FreeAndNil(ThreadMsgClient);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure SetMessageHandler(Handler: TSMMessageCallback);
+begin
+If Assigned(ThreadMsgClient) then
+  begin
+    If Assigned(ThreadMsgClient.OnMessageEvent) then
+      ThreadMsgClient.OnMessageEvent := nil;
+    ThreadMsgClient.OnMessageCallback := Handler;
+  end
+else raise ESMNoMessageClient.Create('SetMessageHandler: No message client for this thread.');
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure SetMessageHandler(Handler: TSMMessageEvent);
+begin
+If Assigned(ThreadMsgClient) then
+  begin
+    If Assigned(ThreadMsgClient.OnMessageCallback) then
+      ThreadMsgClient.OnMessageCallback := nil;
+    ThreadMsgClient.OnMessageEvent := Handler;
+  end
+else raise ESMNoMessageClient.Create('SetMessageHandler: No message client for this thread.');
+end;
+
+//------------------------------------------------------------------------------
+
+Function ActiveMessages: Boolean;
+begin
+Result := Assigned(ThreadMsgClient);
+end;
+
+//------------------------------------------------------------------------------
+
+Function SendMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): TSMMessageResult;
+begin
+If Assigned(ThreadMsgClient) then
+  Result := ThreadMsgClient.SendMessage(Recipient,Param1,Param2)
+else
+  raise ESMNoMessageClient.Create('SendMessage: No message client for this thread.');
+end;
+
+//------------------------------------------------------------------------------
+
+Function PostMessage(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): Boolean;
+begin
+If Assigned(ThreadMsgClient) then
+  Result := ThreadMsgClient.PostMessage(Recipient,Param1,Param2)
+else
+  raise ESMNoMessageClient.Create('PostMessage: No message client for this thread.');
+end;
+
+//------------------------------------------------------------------------------
+
+procedure GetMessages(Timeout: UInt32 = INFINITE);
+begin
+If Assigned(ThreadMsgClient) then
+  ThreadMsgClient.GetMessages(Timeout)
+else
+  raise ESMNoMessageClient.Create('GetMessages: No message client for this thread.');
+end;
+
+//------------------------------------------------------------------------------
+
+procedure PeekMessages;
+begin
+If Assigned(ThreadMsgClient) then
+  ThreadMsgClient.PeekMessages
+else
+  raise ESMNoMessageClient.Create('PeekMessages: No message client for this thread.');
 end;
 
 end.
