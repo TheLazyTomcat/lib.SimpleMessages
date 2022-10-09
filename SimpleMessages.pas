@@ -10,7 +10,9 @@ unit SimpleMessages;
 
 {$IFDEF FPC}
   {$MODE ObjFPC}
-  {.$MODESWITCH DuplicateLocals+}
+  {$MODESWITCH DuplicateLocals+}
+  {$DEFINE FPC_DisableWarns}
+  {$MACRO ON}
 {$ENDIF}
 {$H+}
 
@@ -61,11 +63,21 @@ type
 
 const
   SM_MAXCLIENTS_DEF  = 128;
-  SM_MAXMESSAGES_DEF = 8192;  // this must be strictly larger than SM_MAXCLIENTS_DEF
+  SM_MAXMESSAGES_DEF = 8192;  // this must be larger than or equal to SM_MAXCLIENTS_DEF
 
   CLIENTID_BROADCAST = $FFFF;
 
   INFINITE = UInt32(-1);  // infinite timeout
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+type
+  TSMExtraInfo = record
+    ClientCount:      Integer;
+    MaxClients:       Integer;
+    MessageCount:     Integer;
+    MaxMessages:      Integer;
+    SharedMemorySize: TMemSize;
+  end;       
 
 {-------------------------------------------------------------------------------
     Common types and constants - internal
@@ -149,16 +161,6 @@ type
   TSMFetchMessagesResult = (lmrSentMessage,lmrPostedMessage);
 
   TSMFetchMessagesResults = set of TSMFetchMessagesResult;
-
-// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-type
-  TSMExtraInfo = record
-    ClientCount:      Integer;
-    MaxClients:       Integer;
-    MessageCount:     Integer;
-    MaxMessages:      Integer;
-    SharedMemorySize: TMemSize;
-  end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -283,6 +285,11 @@ implementation
 
 uses
   Windows, Math;
+
+{$IFDEF FPC_DisableWarns}
+  {$DEFINE FPCDWM}
+  {$DEFINE W4055:={$WARN 4055 OFF}} // Conversion between ordinals and pointers is not portable
+{$ENDIF}
 
 {===============================================================================
     Auxiliary functions
@@ -497,7 +504,9 @@ const
 Function TSimpleMessagesClient.GetClientArrayItemPtr(ClientIndex: Integer): PSMShMemClient;
 begin
 If CheckClientIndex(ClientIndex) then
-  Result := PSMShMemClient(PtrUInt(fShMemClientArr) + PtrUInt(ClientIndex * SizeOf(TSMShMemClient)))
+{$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
+  Result := PSMShMemClient(Pointer(PtrUInt(fShMemClientArr) + PtrUInt(ClientIndex * SizeOf(TSMShMemClient))))
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
 else
   raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.GetClientArrayItemPtr: Index (%d) out of bounds.',[ClientIndex]);
 end;
@@ -507,7 +516,9 @@ end;
 Function TSimpleMessagesClient.GetMessageArrayItemPtr(MessageIndex: TSMMessageIndex): PSMShMemMessage;
 begin
 If CheckMessageIndex(MessageIndex) then
-  Result := PSMShMemMessage(PtrUInt(fShMemMessageArr) + PtrUInt(MessageIndex * SizeOf(TSMShMemMessage)))
+{$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
+  Result := PSMShMemMessage(Pointer(PtrUInt(fShMemMessageArr) + PtrUInt(MessageIndex * SizeOf(TSMShMemMessage))))
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
 else
   raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.GetMessageArrayItemPtr: Index (%d) out of bounds.',[MessageIndex]);
 end;
@@ -516,7 +527,9 @@ end;
 
 Function TSimpleMessagesClient.GetMessageArrayNextItemPtr(MessageItem: PSMShMemMessage): PSMShMemMessage;
 begin
-Result := PSMShMemMessage(PtrUInt(MessageItem) + PtrUInt(SizeOf(TSMShMemMessage)));
+{$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
+Result := PSMShMemMessage(Pointer(PtrUInt(MessageItem) + PtrUInt(SizeOf(TSMShMemMessage))));
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
 end;
 
 //------------------------------------------------------------------------------
@@ -529,9 +542,9 @@ If CheckMessageIndex(MessageIndex) then
   begin
     MessageItemPtr := GetMessageArrayItemPtr(MessageIndex);
     If CheckMessageIndex(MessageItemPtr^.Prev) then
-      GetMessageArrayItemPtr(MessageItemPtr^.Prev).Next := MessageItemPtr^.Next;
+      GetMessageArrayItemPtr(MessageItemPtr^.Prev)^.Next := MessageItemPtr^.Next;
     If CheckMessageIndex(MessageItemPtr^.Next) then
-      GetMessageArrayItemPtr(MessageItemPtr^.Next).Prev := MessageItemPtr^.Prev;
+      GetMessageArrayItemPtr(MessageItemPtr^.Next)^.Prev := MessageItemPtr^.Prev;
     If MessageIndex = fShMemHead^.Messages.FirstFree then
       fShMemHead^.Messages.FirstFree := MessageItemPtr^.Next;
     If MessageIndex = fShMemHead^.Messages.LastFree then
@@ -667,7 +680,7 @@ If CheckClientIndex(ClientIndex) then
     else DuplicateClientSynchronizer;
     // set flags and release the event
     ClientItemPtr^.Flags := ClientItemPtr^.Flags or SetFlags;
-    fClientSyncs[ClientIndex].Synchronizer.SetEventStrict;
+    fClientSyncs[ClientIndex].Synchronizer.SetEvent;
   end
 else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.WakeClient: Client index (%d) out of bounds.',[ClientIndex]);
 end;
@@ -730,7 +743,7 @@ If fShMemHead^.MaxMessages < (fShMemHead^.Messages.Count + TrueReqCount) then
     fShMemHead^.Clients.Flags := fShMemHead^.Clients.Flags and not SM_CLIENTSFLAG_MSGSLTWT;
     // check whether some other client is waiting for a free slot, if so, mark it again in clients flags
     For i := LowClientIndex to HighClientIndex do
-      If GetClientArrayItemPtr(i).Flags and SM_CLIENTFLAG_MSGSLTWT <> 0 then
+      If GetClientArrayItemPtr(i)^.Flags and SM_CLIENTFLAG_MSGSLTWT <> 0 then
         begin
           fShMemHead^.Clients.Flags := fShMemHead^.Clients.Flags or SM_CLIENTSFLAG_MSGSLTWT;
           Break{For i};
@@ -801,7 +814,6 @@ var
   MasterMessagePtr:     PSMShMemMessage;
   i:                    Integer;
 begin
-Result := 0;
 // first do direct dispatch
 TempMessage := ConstructMessage(fClientID,fClientID,SM_MSGFLAG_SENT or SM_MSGFLAG_BROADCAST,Param1,Param2,-1);
 DirectDispatchResult := DirectDispatchMessage(TempMessage);
@@ -1181,9 +1193,11 @@ try
         (TMemSize((MaxClients * SizeOf(TSMShMemClient)) + 31) and not TMemSize(31));
     end;
   // calculate pointers from offsets
+{$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
   fShMemClientMap := Pointer(PtrUInt(fShMemHead) + PtrUInt(fShMemHead^.Clients.MapOffset));
   fShMemClientArr := Pointer(PtrUInt(fShMemHead) + PtrUInt(fShMemHead^.Clients.ArrayOffset));
   fShMemMessageArr := Pointer(PtrUInt(fShMemHead) + PtrUInt(fShMemHead^.Messages.ArrayOffset));
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
   // init the linked list (must be after pointers setup)
   If fIsFounder then
     begin
