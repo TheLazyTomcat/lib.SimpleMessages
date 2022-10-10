@@ -38,7 +38,7 @@
     For more information on this unit, contact the author or consult with the
     source code.
 
-  Version 1.0 alpha - requires extensive testing (2022-10-09)
+  Version 1.0 alpha (requires extensive testing) (2022-10-09)
 
   Last change 2022-10-09
 
@@ -601,7 +601,7 @@ end;
 --------------------------------------------------------------------------------
 ===============================================================================}
 const
-  SM_SHAREDMEM_PREFIX = 'sm_shared_mem_';
+  SM_SHAREDMEM_PREFIX = 'sm_shrdmem_';
 
   SM_CLIENTSFLAG_MSGSLTWT = UInt32($00000001);  // at least one client is waiting for a free message slot
 
@@ -610,12 +610,12 @@ const
   SM_CLIENTFLAG_RECVMSG  = UInt32(SM_CLIENTFLAG_RECVSMSG or SM_CLIENTFLAG_RECVPMSG);  // received a message
   SM_CLIENTFLAG_MSGSLTWT = UInt32($00000004); // client is waiting for a free message slot
 
-  SM_MSGFLAG_SENT       = UInt32($00000001);  // message was sent, not posted
-  SM_MSGFLAG_BROADCAST  = UInt32($00000002);  // broadcasted message
-  SM_MSGFLAG_MASTER     = UInt32($00000004);  // sent broadcasted master message
-  SM_MSGFLAG_FETCHED    = UInt32($00000008);  // message is fetched but not removed (sent messages, prevents refetching)
-  SM_MSGFLAG_RELEASED   = UInt32($00000010);  // sender is released from waiting
-  SM_MSGFLAG_PROCESSED  = UInt32($00000020);  // message was processed by recipient
+  SM_MSGFLAG_SENT      = UInt32($00000001); // message was sent, not posted
+  SM_MSGFLAG_BROADCAST = UInt32($00000002); // broadcasted message
+  SM_MSGFLAG_MASTER    = UInt32($00000004); // sent broadcasted master message
+  SM_MSGFLAG_FETCHED   = UInt32($00000008); // message is fetched but not removed (sent messages, prevents refetching)
+  SM_MSGFLAG_RELEASED  = UInt32($00000010); // sender is released from waiting
+  SM_MSGFLAG_PROCESSED = UInt32($00000020); // message was processed by recipient
 
 {===============================================================================
     TSimpleMessagesClient - class implementation
@@ -779,6 +779,9 @@ end;
 procedure TSimpleMessagesClient.WakeClient(ClientIndex: Integer; SetFlags: UInt32);
 var
   ClientItemPtr:  PSMShMemClient;
+{$IFNDEF Windows}
+  CallResult:     cInt;
+{$ENDIF}
 
 {$IFDEF Windows}
   procedure DuplicateClientSynchronizer;
@@ -808,9 +811,11 @@ If CheckClientIndex(ClientIndex) then
     // set flags and release the event
     ClientItemPtr^.Flags := ClientItemPtr^.Flags or SetFlags;
   {$IFDEF Windows}
-    fClientSyncs[ClientIndex].Synchronizer.SetEvent;
+    fClientSyncs[ClientIndex].Synchronizer.SetEventStrict;
   {$ELSE}
-    event_auto_unlock(Addr(GetClientArrayItemPtr(ClientIndex)^.Synchronizer));
+    CallResult := event_auto_unlock(Addr(GetClientArrayItemPtr(ClientIndex)^.Synchronizer));
+    If CallResult <> 0 then
+      raise ESMSystemError.CreateFmt('TSimpleMessagesClient.WakeClient: Failed to unlock event (%d)',[CallResult]);
   {$ENDIF}
   end
 else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.WakeClient: Client index (%d) out of bounds.',[ClientIndex]);
@@ -1299,6 +1304,8 @@ var
   i:              TSMMessageIndex;
 {$IFDEF Windows}
   j:              Integer;
+{$ELSE}
+  CallResult:     cInt;
 {$ENDIF}
 begin
 // sanity checks
@@ -1386,7 +1393,9 @@ try
       fShMemClient^.Synchronizer := TSMCrossHandle(fSynchronizer.Handle);
     {$ELSE}
       fSynchronizer := Addr(fShMemClient^.Synchronizer);
-      event_auto_init(fSynchronizer);
+      CallResult := event_auto_init(fSynchronizer);
+      If CallResult <> 0 then
+        raise ESMSystemError.CreateFmt('TSimpleMessagesClient.Initialize: Failed to initialize event (%d).',[CallResult]);
     {$ENDIF}
       fClientMap[MapFreeIdx] := True;
       Inc(fShMemHead^.Clients.Count);
