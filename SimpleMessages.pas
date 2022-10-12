@@ -28,7 +28,7 @@
                 a stack overflow. Be aware of this.
 
     To fetch and dispatch/process any incoming messages, call PeekMessages
-    (non-blocking) or GetMessages (blocks until a message it received or a
+    (non-blocking) or GetMessages (blocks until a message is received or a
     given timeout elapses).
 
     Also, there are two ways how to use this unit - either create an instance
@@ -40,7 +40,7 @@
 
   Version 1.0 alpha (requires extensive testing) (2022-10-09)
 
-  Last change 2022-10-09
+  Last change 2022-10-12
 
   ©2022 František Milt
 
@@ -192,16 +192,15 @@ type
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 type
   TSMShMemClients = packed record
-    Count:        Int32;
-    Flags:        UInt32;
-    MapOffset:    UInt32;
-    ArrayOffset:  UInt32;
+    Count:                Int32;
+    MessageSlotWaitCount: Int32;
+    MapOffset:            UInt32;
+    ArrayOffset:          UInt32;
   end;
   PSMShMemClients = ^TSMShMemClients;
 
   TSMShMemMessages = packed record
     Count:        Int32;
-    Flags:        UInt32;
     ArrayOffset:  UInt32;
     // linked list indices
     FirstFree:    TSMMessageIndex;
@@ -215,7 +214,6 @@ type
     Initialized:  Boolean;
     MaxClients:   Int32;
     MaxMessages:  Int32;
-    Flags:        UInt32;
     Clients:      TSMShMemClients;
     Messages:     TSMShMemMessages;
   end;
@@ -603,8 +601,6 @@ end;
 const
   SM_SHAREDMEM_PREFIX = 'sm_shrdmem_';
 
-  SM_CLIENTSFLAG_MSGSLTWT = UInt32($00000001);  // at least one client is waiting for a free message slot
-
   SM_CLIENTFLAG_RECVSMSG = UInt32($00000001); // received sent message(s)
   SM_CLIENTFLAG_RECVPMSG = UInt32($00000002); // received posted message(s)
   SM_CLIENTFLAG_RECVMSG  = UInt32(SM_CLIENTFLAG_RECVSMSG or SM_CLIENTFLAG_RECVPMSG);  // received a message
@@ -829,7 +825,7 @@ var
   i:            Integer;
 begin
 // wake clients waiting for free message slot (as many as there is free slots)
-If fShMemHead^.Clients.Flags and SM_CLIENTSFLAG_MSGSLTWT <> 0 then
+If fShMemHead^.Clients.MessageSlotWaitCount > 0 then
   begin
     FreeMsgSlots := fShMemHead^.MaxMessages - fShMemHead^.Messages.Count;
     If FreeMsgSlots > 0 then
@@ -858,36 +854,29 @@ procedure TSimpleMessagesClient.WaitMessageSlots(ClientsCount: Boolean);
       Result := 1;
   end;
 
-var
-  i:  Integer;
 begin
 If fShMemHead^.MaxMessages < (fShMemHead^.Messages.Count + TrueReqCount) then
   begin
-    while fShMemHead^.MaxMessages < (fShMemHead^.Messages.Count + TrueReqCount) do
-      begin
-        fShMemClient^.Flags := fShMemClient^.Flags or SM_CLIENTFLAG_MSGSLTWT;
-        fShMemHead^.Clients.Flags := fShMemHead^.Clients.Flags or SM_CLIENTSFLAG_MSGSLTWT;
-        fSharedMemory.Unlock;
-        try
-        {$IFDEF Windows}
-          fSynchronizer.WaitFor; // infinite wait
-        {$ELSE}
-          event_auto_wait(fSynchronizer);
-        {$ENDIF}
-        finally
-          fSharedMemory.Lock;
-        end;
-      end;
-    // clear the flags
-    fShMemClient^.Flags := fShMemClient^.Flags and not SM_CLIENTFLAG_MSGSLTWT;
-    fShMemHead^.Clients.Flags := fShMemHead^.Clients.Flags and not SM_CLIENTSFLAG_MSGSLTWT;
-    // check whether some other client is waiting for a free slot, if so, mark it again in clients flags
-    For i := LowClientIndex to HighClientIndex do
-      If GetClientArrayItemPtr(i)^.Flags and SM_CLIENTFLAG_MSGSLTWT <> 0 then
+    fShMemClient^.Flags := fShMemClient^.Flags or SM_CLIENTFLAG_MSGSLTWT;
+    Inc(fShMemHead^.Clients.MessageSlotWaitCount);
+    try
+      while fShMemHead^.MaxMessages < (fShMemHead^.Messages.Count + TrueReqCount) do
         begin
-          fShMemHead^.Clients.Flags := fShMemHead^.Clients.Flags or SM_CLIENTSFLAG_MSGSLTWT;
-          Break{For i};
+          fSharedMemory.Unlock;
+          try
+          {$IFDEF Windows}
+            fSynchronizer.WaitFor; // infinite wait
+          {$ELSE}
+            event_auto_wait(fSynchronizer);
+          {$ENDIF}
+          finally
+            fSharedMemory.Lock;
+          end;
         end;
+    finally
+      Dec(fShMemHead^.Clients.MessageSlotWaitCount);
+      fShMemClient^.Flags := fShMemClient^.Flags and not SM_CLIENTFLAG_MSGSLTWT;
+    end;
   end;
 end;
 
@@ -939,6 +928,7 @@ If Recipient <> fClientID then
               else
                 Result := 0;
               RemoveMessage(MessageItemPtr^.Index);
+              WakeClientsMsgSlots;
             end;
         end;
     finally
@@ -1005,6 +995,7 @@ try
           // get result and remove the master message
           Result := TSMMessageResult(MasterMessagePtr^.P1_Result);
           RemoveMessage(MasterMessagePtr^.Index);
+          WakeClientsMsgSlots;
         end
       else Result := DirectDispatchResult;
     end
