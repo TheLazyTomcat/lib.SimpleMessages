@@ -35,12 +35,15 @@
     of TSimpleMessagesClient class and call its methods, or use provided
     procedural interface (standalone functions InitMessages, SendMessage, ...).
 
+      WARNING - when using an TSimpleMessagesClient instance, do creation and
+                all method calls within a single thread.
+
     For more information on this unit, contact the author or consult with the
     source code.
 
-  Version 1.0 alpha (requires extensive testing) (2022-10-09)
+  Version 1.0 alpha 2 (requires extensive testing) (2022-10-20)
 
-  Last change 2022-10-12
+  Last change 2022-10-20
 
   ©2022 František Milt
 
@@ -100,6 +103,7 @@ unit SimpleMessages;
 
 {$IFDEF FPC}
   {$MODE ObjFPC}
+  {$MODESWITCH ClassicProcVars+}
   {$MODESWITCH DuplicateLocals+}
   {$DEFINE FPC_DisableWarns}
   {$MACRO ON}
@@ -109,7 +113,7 @@ unit SimpleMessages;
 interface
 
 uses
-  SysUtils,
+  SysUtils, {$IFNDEF Windows}BaseUnix, {$ENDIF}
   AuxTypes, AuxClasses, BitVector, MemVector, SharedMemoryStream,
 {$IFDEF Windows}
   WinSyncObjs
@@ -222,14 +226,18 @@ type
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 type
   TSMShMemClient = packed record
-    Flags:        UInt32;
+    Flags:          UInt32;
   {$IFDEF Windows}
-    Identifier:   TGUID;
-    ProcessID:    DWORD;
-    Synchronizer: TSMCrossHandle;
+    Identifier:     TGUID;
+    ProcessID:      DWORD;
+    Synchronizer:   TSMCrossHandle;
+    ThreadID:       DWORD;
   {$ELSE}
-    Synchronizer: TLSOSimpleEvent;
+    Synchronizer:   TLSOSimpleEvent;
+    ThreadID:       pid_t;
   {$ENDIF}
+    T2TWakeupCode:  UInt64;
+    T2TWakeupData:  UInt64;
   end;
   PSMShMemClient = ^TSMShMemClient;
 
@@ -303,6 +311,7 @@ type
 type
   TSimpleMessagesClient = class(TCustomObject)
   protected
+    fThreadID:              {$IFDEF Windows}DWORD{$ELSE}pid_t{$ENDIF};
     fIsFounder:             Boolean;
     fClientID:              TSMClientID;
     fSharedMemory:          TSharedMemory;
@@ -331,6 +340,7 @@ type
     procedure RemoveMessage(MessageIndex: TSMMessageIndex); virtual;            // NL
     procedure ReleaseSentMessage(MessageIndex: TSMMessageIndex; Processed: Boolean; MsgResult: TSMMessageResult); virtual;  // NL
     procedure WakeClient(ClientIndex: Integer; SetFlags: UInt32); virtual;      // NL
+    procedure ThreadToThreasWakeupCall(ClientIndex: Integer); virtual;          // NL
     procedure WakeClientsMsgSlots; virtual;                                     // NL
     procedure WaitMessageSlots(ClientsCount: Boolean); virtual;                 // NL
     Function SendSinglecast(Recipient: TSMClientID; Param1, Param2: TSMMessageParam): TSMMessageResult; virtual;
@@ -343,6 +353,7 @@ type
     procedure DispatchSentMessages; virtual;
     procedure DispatchPostedMessages; virtual;
     Function InternalPeekMessages: Boolean; virtual;
+    procedure ThreadToThreadWakeup; virtual;
     // events firing
     procedure DoMessage(var Msg: TSMMessage; var Flags: TSMDispatchFlags); virtual;
     // object init/final
@@ -405,7 +416,7 @@ procedure PeekMessages;
 implementation
 
 uses
-  {$IFDEF Windows}Windows,{$ELSE}BaseUnix, Linux,{$ENDIF} Math;
+  {$IFDEF Windows}Windows,{$ELSE}Linux, SysCall, {$ENDIF} Math;
 
 {$IFDEF FPC_DisableWarns}
   {$DEFINE FPCDWM}
@@ -476,6 +487,15 @@ Result.Index := -1;
 Result.Prev := -1;
 Result.Next := -1;
 end;
+
+//------------------------------------------------------------------------------
+
+{$IFNDEF Windows}
+Function gettid: pid_t;
+begin
+Result := do_syscall(syscall_nr_gettid);
+end;
+{$ENDIF}
 
 
 {===============================================================================
@@ -819,6 +839,36 @@ end;
 
 //------------------------------------------------------------------------------
 
+procedure TSimpleMessagesClient.ThreadToThreasWakeupCall(ClientIndex: Integer);
+type
+  TObjProc = procedure of object;
+var
+  ClientItemPtr:  PSMShMemClient;
+  MethodToCall:   TMethod;
+begin
+If CheckClientIndex(ClientIndex) then
+  begin
+    ClientItemPtr := GetClientArrayItemPtr(ClientIndex);
+    If ClientItemPtr^.ThreadID = fThreadID then
+      begin
+      {$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
+        MethodToCall.Code := Pointer(PtrUInt(ClientItemPtr^.T2TWakeupCode));
+        MethodToCall.Data := Pointer(PtrUInt(ClientItemPtr^.T2TWakeupData));
+      {$IFDEF FPCDWM}{$POP}{$ENDIF}
+        // call the method (unlock data so the called client can safely lock the for itself)
+        fSharedMemory.Unlock;
+        try
+          TObjProc(MethodToCall);
+        finally
+          fSharedMemory.Lock;
+        end;
+      end;
+  end
+else raise ESMIndexOutOfBounds.CreateFmt('TSimpleMessagesClient.ThreadToThreasWakeupCall: Client index (%d) out of bounds.',[ClientIndex]);
+end;
+
+//------------------------------------------------------------------------------
+
 procedure TSimpleMessagesClient.WakeClientsMsgSlots;
 var
   FreeMsgSlots: Integer;
@@ -906,6 +956,7 @@ If Recipient <> fClientID then
             begin  
               MessageItemPtr := GetMessageArrayItemPtr(AddMessage(TempMessage));
               WakeClient(Integer(Recipient),SM_CLIENTFLAG_RECVSMSG);
+              ThreadToThreasWakeupCall(Integer(Recipient));
               // wait for message processing, also process incoming sent messages
               while MessageItemPtr^.Flags and SM_MSGFLAG_RELEASED = 0 do
                 begin
@@ -975,6 +1026,7 @@ try
                 TempMessage.Recipient := TSMClientID(i);
                 AddMessage(TempMessage);
                 WakeClient(Integer(TempMessage.Recipient),SM_CLIENTFLAG_RECVSMSG);
+                ThreadToThreasWakeupCall(Integer(TempMessage.Recipient));
               end;
           // wait on master message
           while MasterMessagePtr^.Flags and SM_MSGFLAG_RELEASED = 0 do
@@ -1278,6 +1330,20 @@ end;
 
 //------------------------------------------------------------------------------
 
+procedure TSimpleMessagesClient.ThreadToThreadWakeup;
+begin
+{
+  This method is called directly from other client that is running in the same
+  thread as this one when he sents a message here.
+  This prevents a deadlock when sending messages between clients in one thread
+  (sender is waiting while recipient cannot react).
+}
+If lmrSentMessage in FetchMessages then
+  DispatchSentMessages;
+end;
+
+//------------------------------------------------------------------------------
+
 procedure TSimpleMessagesClient.DoMessage(var Msg: TSMMessage; var Flags: TSMDispatchFlags);
 begin
 If Assigned(fOnMessageEvent) then
@@ -1304,6 +1370,7 @@ If (MaxClients <= 0) or (MaxClients >= CLIENTID_BROADCAST) then
   raise ESMInvalidValue.CreateFmt('TSimpleMessagesClient.Initialize: Invalid client limit (%d).',[MaxClients]);
 If (MaxMessages <= 0) or (MaxMessages < MaxClients) then
   raise ESMInvalidValue.CreateFmt('TSimpleMessagesClient.Initialize: Invalid message limit (%d).',[MaxMessages]);
+fThreadID := {$IFDEF Windows}GetCurrentThreadID{$ELSE}gettid{$ENDIF};
 // create shared memory
 fSharedMemory := TSharedMemory.Create(
   // calculate expected shared memory size...
@@ -1382,12 +1449,18 @@ try
         raise ESMOutOfResources.Create('TSimpleMessagesClient.Initialize: Cannot generate client GUID.');
       fShMemClient^.ProcessID := GetCurrentProcessID;
       fShMemClient^.Synchronizer := TSMCrossHandle(fSynchronizer.Handle);
+      fShMemClient^.ThreadID := GetCurrentThreadID;
     {$ELSE}
       fSynchronizer := Addr(fShMemClient^.Synchronizer);
       CallResult := event_auto_init(fSynchronizer);
       If CallResult <> 0 then
         raise ESMSystemError.CreateFmt('TSimpleMessagesClient.Initialize: Failed to initialize event (%d).',[CallResult]);
+      fShMemClient^.ThreadID := gettid;
     {$ENDIF}
+    {$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
+      fShMemClient^.T2TWakeupCode := UInt64(PtrUInt(@TSimpleMessagesClient.ThreadToThreadWakeup));
+      fShMemClient^.T2TWakeupData := UInt64(PtrUInt(Self));
+    {$IFDEF FPCDWM}{$POP}{$ENDIF}
       fClientMap[MapFreeIdx] := True;
       Inc(fShMemHead^.Clients.Count);
       fClientID := TSMClientID(MapFreeIdx);
