@@ -1449,14 +1449,13 @@ try
         raise ESMOutOfResources.Create('TSimpleMessagesClient.Initialize: Cannot generate client GUID.');
       fShMemClient^.ProcessID := GetCurrentProcessID;
       fShMemClient^.Synchronizer := TSMCrossHandle(fSynchronizer.Handle);
-      fShMemClient^.ThreadID := GetCurrentThreadID;
     {$ELSE}
       fSynchronizer := Addr(fShMemClient^.Synchronizer);
       CallResult := event_auto_init(fSynchronizer);
       If CallResult <> 0 then
         raise ESMSystemError.CreateFmt('TSimpleMessagesClient.Initialize: Failed to initialize event (%d).',[CallResult]);
-      fShMemClient^.ThreadID := gettid;
     {$ENDIF}
+      fShMemClient^.ThreadID := fThreadID;
     {$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
       fShMemClient^.T2TWakeupCode := UInt64(PtrUInt(@TSimpleMessagesClient.ThreadToThreadWakeup));
       fShMemClient^.T2TWakeupData := UInt64(PtrUInt(Self));
@@ -1685,7 +1684,7 @@ end;
     Procedural interface - implementation
 ===============================================================================}
 threadvar
-  ThreadMsgClient:  TSimpleMessagesClient;  // automatically initilaized to nil
+  ThreadMsgClient:  TSimpleMessagesClient;  // automatically initialized to nil
 
 //------------------------------------------------------------------------------
 
